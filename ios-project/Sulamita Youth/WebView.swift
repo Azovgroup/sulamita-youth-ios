@@ -117,6 +117,14 @@ extension ViewController: WKUIDelegate, WKDownloadDelegate {
             return decisionHandler(.download)
         }
 
+        // Sub-frame loads (Square's Web Payments SDK draws its card fields and wallet
+        // buttons in iframes on web.squarecdn.com / pci-connect.squareup.com) stay inside
+        // the web view. Without this, every iframe load off our host was cancelled and
+        // presented as a Safari sheet, which Daniel saw on /give as a jump to a Square site.
+        if let frame = navigationAction.targetFrame, !frame.isMainFrame {
+            return decisionHandler(.allow)
+        }
+
         if let requestUrl = navigationAction.request.url{
             if let requestHost = requestUrl.host {
                 // NOTE: Match auth origin first, because host origin may be a subset of auth origin and may therefore always match
