@@ -3,9 +3,9 @@ import FirebaseCore
 import FirebaseMessaging
 
 
-@UIApplicationMain
 let gcmMessageIDKey = "gcm.message_id"
 
+@UIApplicationMain
 class AppDelegate: UIResponder, UIApplicationDelegate {
     
     var window : UIWindow?

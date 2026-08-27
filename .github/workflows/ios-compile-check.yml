@@ -2,9 +2,6 @@ name: Compile Sulamita Youth iOS shell
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - "ios-project/**"
 
 permissions:
   contents: read
