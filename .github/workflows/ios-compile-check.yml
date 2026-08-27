@@ -1,0 +1,75 @@
+name: Compile Sulamita Youth iOS shell
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "ios-project/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sulamita-youth-ios-compile-check
+  cancel-in-progress: false
+
+jobs:
+  simulator-build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      IOS_PROJECT_DIR: ios-project
+      APP_SCHEME: Sulamita Youth
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Ruby for pinned CocoaPods
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+
+      - name: Record runner versions
+        run: |
+          {
+            echo "=== macOS runner ==="
+            sw_vers
+            echo
+            echo "=== Xcode ==="
+            xcodebuild -version
+            echo
+          } | tee "${RUNNER_TEMP}/xcodebuild.log"
+
+      - name: Install iOS dependencies
+        working-directory: ${{ env.IOS_PROJECT_DIR }}
+        run: |
+          set -o pipefail
+          bundle install 2>&1 | tee -a "${RUNNER_TEMP}/xcodebuild.log"
+          bundle exec pod install --repo-update 2>&1 | tee -a "${RUNNER_TEMP}/xcodebuild.log"
+
+      - name: Build unsigned simulator app
+        working-directory: ${{ env.IOS_PROJECT_DIR }}
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -workspace "Sulamita Youth.xcworkspace" \
+            -scheme "${APP_SCHEME}" \
+            -sdk iphonesimulator \
+            -configuration Debug \
+            -derivedDataPath "${RUNNER_TEMP}/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            build 2>&1 | tee -a "${RUNNER_TEMP}/xcodebuild.log"
+
+          BUILT_APP="$(find "${RUNNER_TEMP}/DerivedData/Build/Products/Debug-iphonesimulator" -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "${BUILT_APP}"
+          echo "BUILT_APP_PATH=${BUILT_APP}" | tee -a "${RUNNER_TEMP}/xcodebuild.log"
+
+      - name: Upload xcodebuild log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-simulator-xcodebuild-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: error
+          retention-days: 14

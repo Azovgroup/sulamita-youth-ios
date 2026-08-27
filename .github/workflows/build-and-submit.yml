@@ -1,0 +1,174 @@
+# Put this file at .github/workflows/build-and-submit.yml and keep ios-project/
+# at the repository root.
+#
+# APPLE ACCOUNT REQUIRED: create these GitHub Actions secrets after the church's
+# Apple Developer Program and App Store Connect accounts exist:
+# - APPLE_TEAM_ID: 10-character Apple Developer Team ID.
+# - APPLE_DISTRIBUTION_CERTIFICATE_BASE64: base64 of an Apple Distribution .p12.
+# - APPLE_DISTRIBUTION_CERTIFICATE_PASSWORD: password used when exporting the .p12.
+# - APPLE_PROVISIONING_PROFILE_BASE64: base64 of an App Store distribution
+#   .mobileprovision for org.sulamitachurch.youth.
+# - APP_STORE_CONNECT_KEY_ID: App Store Connect API key ID.
+# - APP_STORE_CONNECT_ISSUER_ID: issuer ID for the team API key.
+# - APP_STORE_CONNECT_PRIVATE_KEY_BASE64: base64 of AuthKey_<KEY_ID>.p8.
+#
+# This workflow uploads a build to App Store Connect. It does not create the
+# Apple bundle ID, App Store Connect app record, signing certificate, profile,
+# API key, store metadata, or an App Review submission.
+
+name: Build and upload Sulamita Youth iOS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sulamita-youth-app-store-upload
+  cancel-in-progress: false
+
+jobs:
+  archive-and-upload:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      IOS_PROJECT_DIR: ios-project
+      APP_SCHEME: Sulamita Youth
+      BUNDLE_ID: org.sulamitachurch.youth
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Ruby for pinned CocoaPods
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+
+      - name: Install iOS dependencies
+        working-directory: ${{ env.IOS_PROJECT_DIR }}
+        run: |
+          bundle install
+          bundle exec pod install --repo-update
+
+      # APPLE ACCOUNT REQUIRED: all following steps need credentials and assets
+      # that cannot exist before enrollment and App Store Connect setup.
+      - name: "[APPLE ACCOUNT REQUIRED] Verify required secrets"
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.APPLE_DISTRIBUTION_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DISTRIBUTION_CERTIFICATE_PASSWORD }}
+          PROFILE_BASE64: ${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 }}
+          API_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY_BASE64 }}
+        run: |
+          missing=0
+          for variable in APPLE_TEAM_ID APP_STORE_CONNECT_KEY_ID APP_STORE_CONNECT_ISSUER_ID CERTIFICATE_BASE64 CERTIFICATE_PASSWORD PROFILE_BASE64 API_PRIVATE_KEY_BASE64; do
+            if [ -z "${!variable}" ]; then
+              echo "::error::Missing required secret/environment value: ${variable}"
+              missing=1
+            fi
+          done
+          exit "${missing}"
+
+      - name: "[APPLE ACCOUNT REQUIRED] Install signing certificate"
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.APPLE_DISTRIBUTION_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DISTRIBUTION_CERTIFICATE_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH="${RUNNER_TEMP}/distribution.p12"
+          KEYCHAIN_PATH="${RUNNER_TEMP}/app-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+
+          printf '%s' "${CERTIFICATE_BASE64}" | base64 -D > "${CERTIFICATE_PATH}"
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security import "${CERTIFICATE_PATH}" -P "${CERTIFICATE_PASSWORD}" -A -t cert -f pkcs12 -k "${KEYCHAIN_PATH}"
+          security set-key-partition-list -S apple-tool:,apple: -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security list-keychain -d user -s "${KEYCHAIN_PATH}"
+
+      - name: "[APPLE ACCOUNT REQUIRED] Install provisioning profile"
+        id: profile
+        env:
+          PROFILE_BASE64: ${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          PROFILE_SOURCE="${RUNNER_TEMP}/app-store.mobileprovision"
+          PROFILE_PLIST="${RUNNER_TEMP}/profile.plist"
+          PROFILE_DIR="${HOME}/Library/MobileDevice/Provisioning Profiles"
+
+          printf '%s' "${PROFILE_BASE64}" | base64 -D > "${PROFILE_SOURCE}"
+          security cms -D -i "${PROFILE_SOURCE}" > "${PROFILE_PLIST}"
+          PROFILE_UUID="$(/usr/libexec/PlistBuddy -c 'Print :UUID' "${PROFILE_PLIST}")"
+          PROFILE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :Name' "${PROFILE_PLIST}")"
+          PROFILE_APP_ID="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "${PROFILE_PLIST}")"
+
+          case "${PROFILE_APP_ID}" in
+            *.${BUNDLE_ID}) ;;
+            *) echo "::error::Provisioning profile is for ${PROFILE_APP_ID}, not ${BUNDLE_ID}"; exit 1 ;;
+          esac
+
+          mkdir -p "${PROFILE_DIR}"
+          cp "${PROFILE_SOURCE}" "${PROFILE_DIR}/${PROFILE_UUID}.mobileprovision"
+          echo "PROFILE_NAME=${PROFILE_NAME}" >> "${GITHUB_ENV}"
+
+      - name: "[APPLE ACCOUNT REQUIRED] Archive signed app"
+        working-directory: ${{ env.IOS_PROJECT_DIR }}
+        run: |
+          xcodebuild \
+            -workspace "Sulamita Youth.xcworkspace" \
+            -scheme "${APP_SCHEME}" \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath "${RUNNER_TEMP}/SulamitaYouth.xcarchive" \
+            DEVELOPMENT_TEAM="${APPLE_TEAM_ID}" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            PROVISIONING_PROFILE_SPECIFIER="${PROFILE_NAME}" \
+            CURRENT_PROJECT_VERSION="${GITHUB_RUN_NUMBER}" \
+            clean archive
+
+      - name: "[APPLE ACCOUNT REQUIRED] Export signed IPA"
+        run: |
+          EXPORT_OPTIONS="${RUNNER_TEMP}/ExportOptions.plist"
+          /usr/bin/plutil -create xml1 "${EXPORT_OPTIONS}"
+          /usr/libexec/PlistBuddy -c 'Add :method string app-store-connect' "${EXPORT_OPTIONS}"
+          /usr/libexec/PlistBuddy -c 'Add :destination string export' "${EXPORT_OPTIONS}"
+          /usr/libexec/PlistBuddy -c 'Add :signingStyle string manual' "${EXPORT_OPTIONS}"
+          /usr/libexec/PlistBuddy -c "Add :teamID string ${APPLE_TEAM_ID}" "${EXPORT_OPTIONS}"
+          /usr/libexec/PlistBuddy -c 'Add :provisioningProfiles dict' "${EXPORT_OPTIONS}"
+          /usr/libexec/PlistBuddy -c "Add :provisioningProfiles:${BUNDLE_ID} string ${PROFILE_NAME}" "${EXPORT_OPTIONS}"
+          /usr/libexec/PlistBuddy -c 'Add :stripSwiftSymbols bool true' "${EXPORT_OPTIONS}"
+          /usr/libexec/PlistBuddy -c 'Add :uploadSymbols bool true' "${EXPORT_OPTIONS}"
+
+          xcodebuild \
+            -exportArchive \
+            -archivePath "${RUNNER_TEMP}/SulamitaYouth.xcarchive" \
+            -exportPath "${RUNNER_TEMP}/export" \
+            -exportOptionsPlist "${EXPORT_OPTIONS}"
+
+      - name: "[APPLE ACCOUNT REQUIRED] Install App Store Connect API key"
+        env:
+          API_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY_BASE64 }}
+        run: |
+          API_KEY_DIR="${HOME}/.appstoreconnect/private_keys"
+          mkdir -p "${API_KEY_DIR}"
+          printf '%s' "${API_PRIVATE_KEY_BASE64}" | base64 -D > "${API_KEY_DIR}/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+          chmod 600 "${API_KEY_DIR}/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+
+      - name: "[APPLE ACCOUNT REQUIRED] Validate and upload IPA to App Store Connect"
+        run: |
+          IPA_PATH="$(find "${RUNNER_TEMP}/export" -maxdepth 1 -name '*.ipa' -print -quit)"
+          test -n "${IPA_PATH}"
+          xcrun altool --validate-app \
+            --file "${IPA_PATH}" \
+            --type ios \
+            --apiKey "${APP_STORE_CONNECT_KEY_ID}" \
+            --apiIssuer "${APP_STORE_CONNECT_ISSUER_ID}"
+          xcrun altool --upload-app \
+            --file "${IPA_PATH}" \
+            --type ios \
+            --apiKey "${APP_STORE_CONNECT_KEY_ID}" \
+            --apiIssuer "${APP_STORE_CONNECT_ISSUER_ID}"
