@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   simulator-build:
-    runs-on: macos-15
+    runs-on: macos-26
     # Failures are read by the Azov box (gh run view --json jobs), never emailed to Daniel: a failed job must not fail the run.
     continue-on-error: true
     timeout-minutes: 20
