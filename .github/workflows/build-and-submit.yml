@@ -156,6 +156,14 @@ jobs:
           printf '%s' "${API_PRIVATE_KEY_BASE64}" | base64 -D > "${API_KEY_DIR}/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
           chmod 600 "${API_KEY_DIR}/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
 
+      - name: Keep the IPA as a run artifact (real-device tap test downloads it)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa
+          path: ${{ runner.temp }}/export/*.ipa
+          if-no-files-found: error
+          retention-days: 14
+
       - name: "[APPLE ACCOUNT REQUIRED] Validate and upload IPA to App Store Connect"
         run: |
           IPA_PATH="$(find "${RUNNER_TEMP}/export" -maxdepth 1 -name '*.ipa' -print -quit)"
