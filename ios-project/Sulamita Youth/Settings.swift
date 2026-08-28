@@ -20,7 +20,7 @@ let authOrigins: [String] = []
 let platformCookie = Cookie(name: "app-platform", value: "iOS App Store")
 
 // UI options
-let displayMode = "standalone" // standalone / fullscreen.
+let displayMode = "fullscreen" // standalone / fullscreen. fullscreen (2026-08-27): the site is safe-area aware (viewport-fit=cover + env() padding), so the web view runs edge to edge like its Safari home-screen install; standalone left a blank band under the status bar.
 let adaptiveUIStyle = true     // iOS 15+ only. Change app theme on the fly to dark/light related to WebView background color.
 let overrideStatusBar = false   // iOS 13-14 only. if you don't support dark/light system theme.
 let statusBarTheme = "dark"    // dark / light, related to override option.
