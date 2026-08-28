@@ -4,10 +4,17 @@
 <dict>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Capture Audio by user request</string>
-	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>Track current location by user request</string>
+	<!-- F14: NSLocationWhenInUseUsageDescription removed. The site never calls
+	     geolocation (youth-track.js does the IP lookup in-process), so the key was
+	     an App Review question with no good answer. -->
 	<key>NSCameraUsageDescription</key>
 	<string>Capture Video by user request</string>
+	<!-- F8: the long-press "Save to Photos" on an album <img> is how most people
+	     will actually save a photograph, and it is unavailable without the Add key. -->
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Save a photo from the church albums to your camera roll.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Attach a photo from your library to a suggestion, a sign-up or a receipt.</string>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
@@ -39,6 +46,19 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<!-- F10: canOpenURL answers false for any scheme not declared here, which is why
+	     the YF portal's viber:// invites were silently swallowed. -->
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>viber</string>
+		<string>tel</string>
+		<string>mailto</string>
+		<string>sms</string>
+		<string>maps</string>
+		<string>comgooglemaps</string>
+		<string>instagram</string>
+		<string>itms-apps</string>
+	</array>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.productivity</string>
 	<key>NSAppTransportSecurity</key>
@@ -65,18 +85,23 @@
 			</array>
 		</dict>
 	</dict>
+	<!-- F7 (option A): remote-notification removed. Nothing registers for remote
+	     notifications (AppDelegate's registerForRemoteNotifications() is commented
+	     out), and declaring a background mode with nothing behind it is a common
+	     App Review rejection. -->
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>processing</string>
-		<string>remote-notification</string>
 	</array>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
 	<key>UIMainStoryboardFile</key>
 	<string>Main</string>
+	<!-- F14: was armv7 (32-bit, template leftover). No current Xcode emits an armv7
+	     slice, so the declared requirement can never be satisfied by the binary. -->
 	<key>UIRequiredDeviceCapabilities</key>
 	<array>
-		<string>armv7</string>
+		<string>arm64</string>
 	</array>
 	<key>UIStatusBarStyle</key>
 	<string>UIStatusBarStyleDefault</string>
@@ -96,9 +121,19 @@
 	</array>
 	<key>UIViewControllerBasedStatusBarAppearance</key>
 	<true/>
+	<!-- F1 + F2: app-bound domains gates main-frame navigation (and is what keeps the
+	     service workers alive), so every host in Settings.swift's allowedOrigins has to
+	     be here too, plus the hosts Square and Flickr draw their iframes from. Six of
+	     the ten allowed entries. Matching covers subdomains: cash.app covers
+	     api.cash.app. -->
 	<key>WKAppBoundDomains</key>
 	<array>
 		<string>youth.sulamitachurch.com</string>
+		<string>merch.sulamitachurch.com</string>
+		<string>cash.app</string>
+		<string>web.squarecdn.com</string>
+		<string>pci-connect.squareup.com</string>
+		<string>embedr.flickr.com</string>
 	</array>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>

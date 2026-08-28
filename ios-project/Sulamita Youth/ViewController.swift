@@ -10,6 +10,10 @@ class ViewController: UIViewController, WKNavigationDelegate, UIDocumentInteract
     }
 
     var documentController: UIDocumentInteractionController?
+    // F3: destination handed to WebKit in download(_:decideDestinationUsing:…),
+    // presented by downloadDidFinish(_:) in WebView.swift. A stored property has to
+    // live on the class — a Swift extension cannot add one.
+    var pendingDownloadURL: URL?
     func documentInteractionControllerViewControllerForPreview(_ controller: UIDocumentInteractionController) -> UIViewController {
         return self
     }
@@ -33,7 +37,13 @@ class ViewController: UIViewController, WKNavigationDelegate, UIDocumentInteract
                 return statusBarTheme == "dark" ? .lightContent : .darkContent
             }
         }
-        return .default
+        // Audit "not verifiable" #6: displayMode = "fullscreen" runs the web view under
+        // the clock and battery, so the glyphs have to follow the page. This returned
+        // .default on every path, which is dark glyphs over the dark offline page
+        // (#0b0b0c) and the dark album lightbox. currentWebViewTheme is maintained by
+        // the themeColor observer in initWebView(); .unspecified (before first paint)
+        // falls to .darkContent, correct for the site's #fbf7ef pages.
+        return currentWebViewTheme == .dark ? .lightContent : .darkContent
     }
 
     override func viewDidLoad() {
@@ -77,6 +87,8 @@ class ViewController: UIViewController, WKNavigationDelegate, UIDocumentInteract
                 currentWebViewTheme = themeColor?.isLight() ?? backgroundColor?.isLight() ?? true ? .light : .dark
                 self.overrideUIStyle()
                 view.backgroundColor = themeColor ?? backgroundColor;
+                // Audit "not verifiable" #6: ask UIKit to re-read preferredStatusBarStyle.
+                self.setNeedsStatusBarAppearanceUpdate()
             }
         }
     }
@@ -259,17 +271,15 @@ extension ViewController: WKScriptMessageHandler {
         if message.name == "print" {
             printView(webView: SulamitaYouth.webView)
         }
-        if message.name == "push-subscribe" {
-            handleSubscribeTouch(message: message)
-        }
-        if message.name == "push-permission-request" {
-            handlePushPermission()
-        }
-        if message.name == "push-permission-state" {
-            handlePushState()
-        }
-        if message.name == "push-token" {
-            handleFCMToken()
-        }
+        // F7 (option A): the push-* handlers are no longer registered in
+        // createWebView, so these arms could never fire. Left here, inert, as the
+        // wiring point if in-app push is ever done properly (option B in the audit:
+        // FirebaseApp.configure() + a real GoogleService-Info.plist + a site-side
+        // bridge). The functions they call still live in PushNotifications.swift.
+        //
+        // if message.name == "push-subscribe" { handleSubscribeTouch(message: message) }
+        // if message.name == "push-permission-request" { handlePushPermission() }
+        // if message.name == "push-permission-state" { handlePushState() }
+        // if message.name == "push-token" { handleFCMToken() }
   }
 }

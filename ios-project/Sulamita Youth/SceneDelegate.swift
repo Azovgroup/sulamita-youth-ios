@@ -1,5 +1,19 @@
 import UIKit
 
+// F14: the three evaluateJavaScript calls below used to interpolate a URL straight
+// into a single-quoted JS string literal — one apostrophe in a universal link or a
+// shortcut URL and the statement is broken JavaScript that silently does nothing.
+// JSONSerialization gives a correctly escaped JS string literal (wrapped in an array
+// because a bare string is not valid top-level JSON on every OS version we build for).
+private func jsonEncoded(_ url: URL) -> String {
+    guard let data = try? JSONSerialization.data(withJSONObject: [url.absoluteString], options: []),
+          let text = String(data: data, encoding: .utf8),
+          text.count >= 2 else {
+        return "\"\""
+    }
+    return String(text.dropFirst().dropLast())
+}
+
 @available(iOS 13.0, *)
 class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 
@@ -48,7 +62,7 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 
             if let url = comps?.url {
                 // Handle it inside our web view in a SPA-friendly way.
-                SulamitaYouth.webView.evaluateJavaScript("location.href = '\(url)'")
+                SulamitaYouth.webView.evaluateJavaScript("location.assign(\(jsonEncoded(url)))")
             }
         }
     }
@@ -66,7 +80,7 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         }
 
         // Handle it inside our web view in a SPA-friendly way.
-        SulamitaYouth.webView.evaluateJavaScript("location.href = '\(universalLink)'")
+        SulamitaYouth.webView.evaluateJavaScript("location.assign(\(jsonEncoded(universalLink)))")
     }
 
     // This function is called if our app is already loaded and the user activates the app via shortcut
@@ -74,7 +88,7 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
                      performActionFor shortcutItem: UIApplicationShortcutItem,
                      completionHandler: @escaping (Bool) -> Void) {
         if let shortcutUrl = URL.init(string: shortcutItem.type) {
-            SulamitaYouth.webView.evaluateJavaScript("location.href = '\(shortcutUrl)'");
+            SulamitaYouth.webView.evaluateJavaScript("location.assign(\(jsonEncoded(shortcutUrl)))");
         }
     }
 

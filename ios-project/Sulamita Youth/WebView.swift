@@ -10,15 +10,22 @@ func createWebView(container: UIView, WKSMH: WKScriptMessageHandler, WKND: WKNav
     let userContentController = WKUserContentController()
 
     userContentController.add(WKSMH, name: "print")
-    userContentController.add(WKSMH, name: "push-subscribe")
-    userContentController.add(WKSMH, name: "push-permission-request")
-    userContentController.add(WKSMH, name: "push-permission-state")
-    userContentController.add(WKSMH, name: "push-token")
+    // F7 (option A): the four push-* handlers are not registered. Nothing on the
+    // site ever posts to them, and handleSubscribeTouch / handleFCMToken reach
+    // Messaging.messaging() while FirebaseApp.configure() is commented out in
+    // AppDelegate — a live handler was a crash waiting for a caller. Push stays
+    // on the web platform (Home Screen install from Safari), which pwa-install.js
+    // already handles. PushNotifications.swift is left in the target untouched.
 
     config.userContentController = userContentController
 
     config.limitsNavigationsToAppBoundDomains = true;
     config.allowsInlineMediaPlayback = true
+    // F11: the iOS default is .all, which left Instagram reels and stories parked
+    // on their poster frame — insta-circles.js calls video.play() and swallows the
+    // rejection, and the story auto-advance has no gesture at all. The site's video
+    // is inline, muted, poster-backed and controls-first.
+    config.mediaTypesRequiringUserActionForPlayback = []
     config.preferences.javaScriptCanOpenWindowsAutomatically = true
     config.preferences.setValue(true, forKey: "standalone")
     
@@ -135,8 +142,14 @@ extension ViewController: WKUIDelegate, WKDownloadDelegate {
         if (navigationAction.request.url?.scheme == "about") {
             return decisionHandler(.allow)
         }
-        if (navigationAction.shouldPerformDownload || navigationAction.request.url?.scheme == "blob") {
+        if (navigationAction.shouldPerformDownload) {
             return decisionHandler(.download)
+        }
+        // F4: a blob: URL asking for a NEW window (yf-files.js / yf-transactions.js do
+        // `window.open(URL.createObjectURL(blob))`) must reach createWebViewWith and
+        // become a popup sheet. Only a same-frame blob navigation is a download.
+        if (navigationAction.request.url?.scheme == "blob") {
+            return decisionHandler(navigationAction.targetFrame == nil ? .allow : .download)
         }
 
         // Sub-frame loads (Square's Web Payments SDK draws its card fields and wallet
@@ -178,27 +191,31 @@ extension ViewController: WKUIDelegate, WKDownloadDelegate {
                     let safariViewController = SFSafariViewController(url: requestUrl)
                     self.present(safariViewController, animated: true, completion: nil)
                 } else {
-                    // Scheme is not supported or no scheme is given, use openURL
-                    if (UIApplication.shared.canOpenURL(requestUrl)) {
-                        UIApplication.shared.open(requestUrl)
+                    // F10: canOpenURL returns false for every scheme absent from
+                    // LSApplicationQueriesSchemes, which silently swallowed the
+                    // viber:// invites the YF portal hands out. open() needs no
+                    // declaration — ask the system and report what it answers.
+                    UIApplication.shared.open(requestUrl, options: [:]) { opened in
+                        if (!opened) { print("F10: no installed app can open \(requestUrl)") }
                     }
                 }
             } else {
                 decisionHandler(.cancel)
-                if (navigationAction.request.url?.scheme == "tel" || navigationAction.request.url?.scheme == "mailto" ){
-                    if (UIApplication.shared.canOpenURL(requestUrl)) {
-                        UIApplication.shared.open(requestUrl)
+                // F10: hostless URLs. The scheme test used to name only tel and mailto,
+                // so the first sms:/maps:/itms-apps: link added to the site would have
+                // been swallowed. Hand every non-http scheme to the system.
+                if requestUrl.isFileURL {
+                    // not tested
+                    downloadAndOpenFile(url: requestUrl.absoluteURL)
+                }
+                else if (!["http", "https"].contains(requestUrl.scheme?.lowercased() ?? "")) {
+                    UIApplication.shared.open(requestUrl, options: [:]) { opened in
+                        if (!opened) { print("F10: no installed app can open \(requestUrl)") }
                     }
                 }
-                else {
-                    if requestUrl.isFileURL {
-                        // not tested
-                        downloadAndOpenFile(url: requestUrl.absoluteURL)
-                    }
-                    // if (requestUrl.absoluteString.contains("base64")){
-                    //     downloadAndOpenBase64File(base64String: requestUrl.absoluteString)
-                    // }
-                }
+                // if (requestUrl.absoluteString.contains("base64")){
+                //     downloadAndOpenBase64File(base64String: requestUrl.absoluteString)
+                // }
             }
         }
         else {
@@ -206,6 +223,24 @@ extension ViewController: WKUIDelegate, WKDownloadDelegate {
         }
 
     }
+    // F5: a server-set `Content-Disposition: attachment` (the calendar's /feed.ics,
+    // the ?dl=1 photo routes, YF exports) is decided here, not in the action delegate
+    // — shouldPerformDownload is false for an ordinary link. With no response delegate
+    // WKWebView defaulted to .allow and tried to render text/calendar as a page, so the
+    // visitor got a blank white screen. Needs F3's downloadDidFinish to be useful.
+    func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
+                 decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        if (!navigationResponse.canShowMIMEType) {
+            return decisionHandler(.download)
+        }
+        if let http = navigationResponse.response as? HTTPURLResponse,
+           let disposition = http.value(forHTTPHeaderField: "Content-Disposition"),
+           disposition.lowercased().hasPrefix("attachment") {
+            return decisionHandler(.download)
+        }
+        decisionHandler(.allow)
+    }
+
     // Handle javascript: `window.alert(message: String)`
     func webView(_ webView: WKWebView,
         runJavaScriptAlertPanelWithMessage message: String,
@@ -377,6 +412,10 @@ extension ViewController: WKUIDelegate, WKDownloadDelegate {
         download.delegate = self
     }
 
+    // F3: openFile() used to run HERE, before completionHandler handed WebKit the
+    // destination — it previewed a path that had just been deleted and not yet written,
+    // which is why every photo Save, Daily Word card, album share card and YF export
+    // opened an empty preview. Remember the destination and present it on finish.
     func download(_ download: WKDownload, decideDestinationUsing response: URLResponse,
                 suggestedFilename: String,
                 completionHandler: @escaping (URL?) -> Void) {
@@ -389,7 +428,28 @@ extension ViewController: WKUIDelegate, WKDownloadDelegate {
             try? FileManager.default.removeItem(at: fileURL)
         }
 
-        self.openFile(url: fileURL)
+        self.pendingDownloadURL = fileURL
         completionHandler(fileURL)
+    }
+
+    // F3: the file exists only once WebKit says it is done.
+    func downloadDidFinish(_ download: WKDownload) {
+        guard let fileURL = self.pendingDownloadURL else { return }
+        self.pendingDownloadURL = nil
+        DispatchQueue.main.async {
+            self.openFile(url: fileURL)
+        }
+    }
+
+    // F3: there was no failure path at all — a failed save looked identical to a
+    // successful one that showed nothing.
+    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+        self.pendingDownloadURL = nil
+        let message = error.localizedDescription
+        DispatchQueue.main.async {
+            let alert = UIAlertController(title: "Download failed", message: message, preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "OK", style: .default, handler: nil))
+            self.present(alert, animated: true, completion: nil)
+        }
     }
 }
