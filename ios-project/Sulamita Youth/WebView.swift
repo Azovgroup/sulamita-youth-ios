@@ -101,12 +101,34 @@ func calcWebviewFrame(webviewView: UIView, toolbarView: UIToolbar?) -> CGRect{
 }
 
 extension ViewController: WKUIDelegate, WKDownloadDelegate {
-    // redirect new tabs to main webview
+    // window.open() gets a REAL popup web view, presented as a sheet the buyer can close.
+    // Google Pay and Cash App Pay run their authorisation in a popup that must share
+    // the opener's configuration (so it can talk back to the page). The template used
+    // to load the popup URL into the main view, which then hit the host filter below
+    // and ended on a Safari sheet with no opener — Daniel saw that as an error page.
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        if (navigationAction.targetFrame == nil) {
-            webView.load(navigationAction.request)
+        let popup = WKWebView(frame: .zero, configuration: configuration)
+        popup.uiDelegate = self
+        popup.allowsBackForwardNavigationGestures = true
+        let host = UIViewController()
+        host.view.backgroundColor = .systemBackground
+        popup.translatesAutoresizingMaskIntoConstraints = false
+        host.view.addSubview(popup)
+        NSLayoutConstraint.activate([
+            popup.topAnchor.constraint(equalTo: host.view.safeAreaLayoutGuide.topAnchor),
+            popup.bottomAnchor.constraint(equalTo: host.view.bottomAnchor),
+            popup.leadingAnchor.constraint(equalTo: host.view.leadingAnchor),
+            popup.trailingAnchor.constraint(equalTo: host.view.trailingAnchor)
+        ])
+        host.modalPresentationStyle = .pageSheet
+        self.present(host, animated: true, completion: nil)
+        return popup
+    }
+    // window.close() from inside the popup dismisses the sheet.
+    func webViewDidClose(_ webView: WKWebView) {
+        if let presented = self.presentedViewController, webView.isDescendant(of: presented.view) {
+            presented.dismiss(animated: true, completion: nil)
         }
-        return nil
     }
     // restrict navigation to target host, open external links in 3rd party apps
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
