@@ -1,0 +1,130 @@
+name: Safari shot (iOS Simulator)
+run-name: safari-shot ${{ inputs.id }}
+
+# Screenshots of web pages in real iOS Mobile Safari (Xcode iOS Simulator) for the box's
+# iphone-sim-shot tool. The job (URLs, sign-in cookies) arrives encrypted and the PNGs leave
+# encrypted with the SHOT_KEY secret, so nothing readable lands in this public repo's logs or artifacts.
+on:
+  workflow_dispatch:
+    inputs:
+      id:
+        description: run id chosen by the box
+        required: true
+      job:
+        description: encrypted job (base64)
+        required: true
+
+jobs:
+  shot:
+    runs-on: macos-26
+    timeout-minutes: 25
+    steps:
+      - name: Decrypt job
+        env:
+          SHOT_KEY: ${{ secrets.SHOT_KEY }}
+          JOB: ${{ inputs.job }}
+        run: |
+          mkdir -p work out
+          printf '%s' "$JOB" | openssl base64 -d -A | openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:SHOT_KEY -out work/job.json
+          python3 -c "import json;j=json.load(open('work/job.json'));print('shots:',len(j['shots']))"
+
+      - name: Boot simulator
+        run: |
+          WANT=$(python3 -c "import json;print(json.load(open('work/job.json')).get('device') or 'iPhone 17 Pro Max')")
+          UDID=$(xcrun simctl list devices available -j | python3 -c "
+          import json,sys,re
+          want=sys.argv[1]; d=json.load(sys.stdin)['devices']
+          rows=[(rt,x) for rt,xs in d.items() if 'iOS' in rt for x in xs]
+          ver=lambda rt:[int(n) for n in re.findall(r'\d+',rt.split('iOS')[-1])]
+          rows.sort(key=lambda r:ver(r[0]),reverse=True)
+          pick=[r for r in rows if r[1]['name']==want] or [r for r in rows if 'Pro Max' in r[1]['name']] or rows
+          rt,x=pick[0]; print(x['udid']); print(x['name'],rt.split('.')[-1],file=sys.stderr)" "$WANT")
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+          # Remote Automation (Settings > Safari > Advanced) so safaridriver can drive Mobile Safari.
+          for k in RemoteAutomationEnabled WebKitRemoteAutomationEnabled; do
+            xcrun simctl spawn "$UDID" defaults write com.apple.mobilesafari "$k" -bool YES || true
+          done
+          xcrun simctl status_bar "$UDID" override --time 9:41 --batteryState charged --batteryLevel 100 --cellularBars 4 || true
+          sudo safaridriver --enable || true
+
+      - name: Shoot
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, time, urllib.request
+          job = json.load(open('work/job.json'))
+          udid = os.environ['UDID']
+          log = []
+          def shot(path):
+              subprocess.run(['xcrun', 'simctl', 'io', udid, 'screenshot', path], check=True, capture_output=True)
+          drv = None
+          def wd(method, path, body=None):
+              req = urllib.request.Request('http://127.0.0.1:4444' + path, method=method,
+                                           data=json.dumps(body).encode() if body is not None else None,
+                                           headers={'Content-Type': 'application/json'})
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  return json.load(r).get('value')
+          sid = None
+          try:
+              drv = subprocess.Popen(['safaridriver', '-p', '4444'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              time.sleep(3)
+              v = wd('POST', '/session', {'capabilities': {'alwaysMatch': {
+                  'browserName': 'Safari', 'platformName': 'iOS', 'safari:useSimulator': True,
+                  'safari:deviceUDID': udid}}})
+              sid = v['sessionId']
+              log.append('driver: safaridriver')
+          except Exception as e:
+              log.append('driver: none (%s); plain openurl' % type(e).__name__)
+          for i, s in enumerate(job['shots']):
+              n = '%02d' % i
+              try:
+                  url = s['url']
+                  if sid:
+                      if s.get('cookies') or s.get('storage'):
+                          wd('POST', '/session/%s/url' % sid, {'url': url})
+                          for c in s.get('cookies') or []:
+                              ck = {k: c[k] for k in ('name', 'value', 'path', 'secure', 'httpOnly') if k in c}
+                              wd('POST', '/session/%s/cookie' % sid, {'cookie': ck})
+                          st = s.get('storage') or {}
+                          for area in ('localStorage', 'sessionStorage'):
+                              for k, val in (st.get(area) or {}).items():
+                                  wd('POST', '/session/%s/execute/sync' % sid,
+                                     {'script': 'window[arguments[0]].setItem(arguments[1], arguments[2])', 'args': [area, k, val]})
+                      wd('POST', '/session/%s/url' % sid, {'url': url})
+                  else:
+                      subprocess.run(['xcrun', 'simctl', 'openurl', udid, url], check=True)
+                  time.sleep(float(s.get('wait', 6)))
+                  steps = [int(s.get('scroll', 0))]
+                  if s.get('full') and sid:
+                      h = wd('POST', '/session/%s/execute/sync' % sid, {'script': 'return [document.documentElement.scrollHeight, window.innerHeight]', 'args': []})
+                      steps = list(range(0, max(h[0] - h[1], 0) + 1, max(h[1] - 120, 200)))[:8]
+                  for j, y in enumerate(steps):
+                      if sid and (y or j):
+                          wd('POST', '/session/%s/execute/sync' % sid, {'script': 'window.scrollTo(0, arguments[0])', 'args': [y]})
+                          time.sleep(1.5)
+                      shot('out/%s-%d.png' % (n, j))
+                  log.append('%s ok %d' % (n, len(steps)))
+              except Exception as e:
+                  log.append('%s fail %s' % (n, type(e).__name__))
+          if sid:
+              try: wd('DELETE', '/session/%s' % sid)
+              except Exception: pass
+          if drv: drv.terminate()
+          open('out/log.txt', 'w').write('\n'.join(log) + '\n')
+          print('\n'.join(log))
+          PY
+
+      - name: Encrypt result
+        env:
+          SHOT_KEY: ${{ secrets.SHOT_KEY }}
+        run: |
+          xcrun simctl list devices booted | grep -v '^==' >> out/log.txt || true
+          tar -czf - -C out . | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -pass env:SHOT_KEY -out result.enc
+          rm -rf out work
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shots-${{ inputs.id }}
+          path: result.enc
+          retention-days: 1
