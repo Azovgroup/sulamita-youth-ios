@@ -46,6 +46,11 @@ jobs:
           for k in RemoteAutomationEnabled WebKitRemoteAutomationEnabled; do
             xcrun simctl spawn "$UDID" defaults write com.apple.mobilesafari "$k" -bool YES || true
           done
+          # Safari's first-launch TipKit bubble ("View Bookmarks, Share Menu ...") covered the page on run 1 (10-01).
+          xcrun simctl spawn "$UDID" defaults write com.apple.mobilesafari com.apple.TipKit.HideAllTips -bool YES || true
+          xcrun simctl spawn "$UDID" defaults write -g com.apple.TipKit.HideAllTips -bool YES || true
+          xcrun simctl launch "$UDID" com.apple.mobilesafari -com.apple.TipKit.HideAllTips 1 || true
+          sleep 4
           xcrun simctl status_bar "$UDID" override --time 9:41 --batteryState charged --batteryLevel 100 --cellularBars 4 || true
           sudo safaridriver --enable || true
 
