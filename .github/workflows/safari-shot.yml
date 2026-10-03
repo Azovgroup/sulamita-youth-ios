@@ -125,6 +125,10 @@ jobs:
                    '{if(a[i].getClientRects().length){e=a[i];break;}}')
           CLICK = FIRST + 'if(!e)return [a.length,false];e.scrollIntoView({block:"center"});e.click();return [a.length,true];'
           TO = FIRST + 'if(!e)return [a.length,false];e.scrollIntoView({block:"center",inline:"nearest"});return [a.length,true];'
+          HIDDEN = ('var e=document.querySelector(arguments[0]);if(!e)return "no match";var o=[];'
+                    'for(var x=e;x&&x!==document.body;x=x.parentElement){var c=getComputedStyle(x);'
+                    'if(c.display==="none"||c.visibility==="hidden")o.push(x.tagName+"."+String(x.className).split(" ").slice(0,2).join(".")+" "+c.display);}'
+                    'return "hidden by: "+(o.join(" < ")||"none (zero-size)");')
           RECT = FIRST + 'if(!e)return null;var r=e.getBoundingClientRect();return [Math.round(r.top),Math.round(r.bottom),window.innerHeight];'
           failed = 0
           for i, s in enumerate(job['shots']):
@@ -162,9 +166,16 @@ jobs:
                       js(SCROLL, [int(s['scroll'])])
                       time.sleep(1.5)
                   if s.get('scroll_to'):
-                      r = js(TO, [s['scroll_to']])
+                      # Late-loading lists (data after the settle): wait up to 30 s for a VISIBLE match.
+                      deadline = time.time() + 30
+                      while True:
+                          r = js(TO, [s['scroll_to']])
+                          if (r and r[1]) or time.time() > deadline:
+                              break
+                          time.sleep(1)
                       if not r or not r[1]:
-                          raise Fail('scroll-to-missing', '%s matches, none visible' % (r and r[0]))
+                          why = js(HIDDEN, [s['scroll_to']])
+                          raise Fail('scroll-to-missing', '%s matches, none visible after 30 s; %s' % (r and r[0], why))
                       time.sleep(2)
                       rc = js(RECT, [s['scroll_to']])
                       if not rc or rc[0] < 0 or rc[1] > rc[2]:
