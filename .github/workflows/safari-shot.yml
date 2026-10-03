@@ -57,70 +57,155 @@ jobs:
       - name: Shoot
         run: |
           python3 - <<'PY'
-          import json, os, subprocess, time, urllib.request
+          # share-1002: a run that cannot do what was asked now FAILS (log line "NN fail <why>", step exit 1),
+          # never a silent plain-openurl shot of the sign-in page. safaridriver gets 4 tries; scrolling goes
+          # through whichever element actually scrolls (#page-scroll on our admin pages, not window);
+          # click / scroll_to / require_text per shot. Public stdout carries status words only; error detail
+          # goes to log.txt, which leaves encrypted.
+          import json, os, subprocess, sys, time, urllib.request, urllib.error
           job = json.load(open('work/job.json'))
           udid = os.environ['UDID']
-          log = []
+          log, pub = [], []
+          def note(line, detail=''):
+              log.append(line + ((' :: ' + detail) if detail else ''))
+              pub.append(line)
           def shot(path):
               subprocess.run(['xcrun', 'simctl', 'io', udid, 'screenshot', path], check=True, capture_output=True)
-          drv = None
-          def wd(method, path, body=None):
+          class Fail(Exception):
+              pass
+          def wd(method, path, body=None, timeout=120):
               req = urllib.request.Request('http://127.0.0.1:4444' + path, method=method,
                                            data=json.dumps(body).encode() if body is not None else None,
                                            headers={'Content-Type': 'application/json'})
-              with urllib.request.urlopen(req, timeout=120) as r:
-                  return json.load(r).get('value')
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as r:
+                      return json.load(r).get('value')
+              except urllib.error.HTTPError as e:
+                  try:
+                      v = json.load(e).get('value') or {}
+                  except Exception:
+                      v = {}
+                  raise RuntimeError('HTTP %s %s: %s' % (e.code, v.get('error', ''), str(v.get('message', ''))[:300]))
+          drv = None
           sid = None
-          try:
-              drv = subprocess.Popen(['safaridriver', '-p', '4444'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-              time.sleep(3)
-              v = wd('POST', '/session', {'capabilities': {'alwaysMatch': {
-                  'browserName': 'Safari', 'platformName': 'iOS', 'safari:useSimulator': True,
-                  'safari:deviceUDID': udid}}})
-              sid = v['sessionId']
-              log.append('driver: safaridriver')
-          except Exception as e:
-              log.append('driver: none (%s); plain openurl' % type(e).__name__)
+          for attempt in range(1, 5):
+              try:
+                  if drv:
+                      drv.terminate()
+                      try: drv.wait(10)
+                      except Exception: drv.kill()
+                  drv = subprocess.Popen(['safaridriver', '-p', '4444'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                  for _ in range(20):
+                      try:
+                          wd('GET', '/status', timeout=5)
+                          break
+                      except Exception:
+                          time.sleep(1)
+                  v = wd('POST', '/session', {'capabilities': {'alwaysMatch': {
+                      'browserName': 'Safari', 'platformName': 'iOS', 'safari:useSimulator': True,
+                      'safari:deviceUDID': udid}}})
+                  sid = v['sessionId']
+                  note('driver: safaridriver (try %d)' % attempt)
+                  break
+              except Exception as e:
+                  note('driver try %d failed' % attempt, '%s %s' % (type(e).__name__, e))
+                  subprocess.run(['xcrun', 'simctl', 'terminate', udid, 'com.apple.mobilesafari'], capture_output=True)
+                  time.sleep(6 * attempt)
+          if not sid:
+              note('driver: none')
+          def js(script, args=()):
+              return wd('POST', '/session/%s/execute/sync' % sid, {'script': script, 'args': list(args)})
+          # The element that really scrolls: the tallest overflow-y auto/scroll box, else the window.
+          FIND = ('var b=null,a=document.querySelectorAll("*");for(var i=0;i<a.length;i++){var e=a[i];'
+                  'if(e.scrollHeight-e.clientHeight>40&&e.clientHeight>200){var o=getComputedStyle(e).overflowY;'
+                  'if((o==="auto"||o==="scroll")&&(!b||e.clientHeight>b.clientHeight))b=e;}}')
+          SCROLL = FIND + 'window.scrollTo(0,arguments[0]);if(b)b.scrollTop=arguments[0];return b?b.scrollTop:window.scrollY;'
+          DIMS = FIND + 'return b?[b.scrollHeight,b.clientHeight]:[document.documentElement.scrollHeight,window.innerHeight];'
+          FIRST = ('var a=document.querySelectorAll(arguments[0]),e=null;for(var i=0;i<a.length;i++)'
+                   '{if(a[i].getClientRects().length){e=a[i];break;}}')
+          CLICK = FIRST + 'if(!e)return [a.length,false];e.scrollIntoView({block:"center"});e.click();return [a.length,true];'
+          TO = FIRST + 'if(!e)return [a.length,false];e.scrollIntoView({block:"center",inline:"nearest"});return [a.length,true];'
+          RECT = FIRST + 'if(!e)return null;var r=e.getBoundingClientRect();return [Math.round(r.top),Math.round(r.bottom),window.innerHeight];'
+          failed = 0
           for i, s in enumerate(job['shots']):
               n = '%02d' % i
+              wait = float(s.get('wait', 6))
+              needs = [k for k in ('cookies', 'storage', 'full', 'scroll', 'click', 'scroll_to', 'require_text') if s.get(k)]
               try:
                   url = s['url']
-                  if sid:
-                      if s.get('cookies') or s.get('storage'):
-                          wd('POST', '/session/%s/url' % sid, {'url': url})
-                          for c in s.get('cookies') or []:
-                              ck = {k: c[k] for k in ('name', 'value', 'path', 'secure', 'httpOnly') if k in c}
-                              wd('POST', '/session/%s/cookie' % sid, {'cookie': ck})
-                          st = s.get('storage') or {}
-                          for area in ('localStorage', 'sessionStorage'):
-                              for k, val in (st.get(area) or {}).items():
-                                  wd('POST', '/session/%s/execute/sync' % sid,
-                                     {'script': 'window[arguments[0]].setItem(arguments[1], arguments[2])', 'args': [area, k, val]})
-                      wd('POST', '/session/%s/url' % sid, {'url': url})
-                  else:
+                  if not sid:
+                      if needs:
+                          raise Fail('needs-driver', 'asked for ' + ','.join(needs))
                       subprocess.run(['xcrun', 'simctl', 'openurl', udid, url], check=True)
-                  time.sleep(float(s.get('wait', 6)))
-                  steps = [int(s.get('scroll', 0))]
-                  if s.get('full') and sid:
-                      h = wd('POST', '/session/%s/execute/sync' % sid, {'script': 'return [document.documentElement.scrollHeight, window.innerHeight]', 'args': []})
+                      time.sleep(wait)
+                      shot('out/%s-0.png' % n)
+                      note('%s ok 1' % n)
+                      continue
+                  if s.get('cookies') or s.get('storage'):
+                      wd('POST', '/session/%s/url' % sid, {'url': url})
+                      for c in s.get('cookies') or []:
+                          ck = {k: c[k] for k in ('name', 'value', 'path', 'secure', 'httpOnly') if k in c}
+                          wd('POST', '/session/%s/cookie' % sid, {'cookie': ck})
+                      st = s.get('storage') or {}
+                      for area in ('localStorage', 'sessionStorage'):
+                          for k, val in (st.get(area) or {}).items():
+                              js('window[arguments[0]].setItem(arguments[1], arguments[2])', [area, k, str(val)])
+                      wd('POST', '/session/%s/url' % sid, {'url': 'about:blank'})
+                  wd('POST', '/session/%s/url' % sid, {'url': url})
+                  time.sleep(wait)
+                  if s.get('click'):
+                      r = js(CLICK, [s['click']])
+                      if not r or not r[1]:
+                          raise Fail('click-target-missing', '%s matches, none visible' % (r and r[0]))
+                      time.sleep(wait)
+                  if s.get('scroll'):
+                      js(SCROLL, [int(s['scroll'])])
+                      time.sleep(1.5)
+                  if s.get('scroll_to'):
+                      r = js(TO, [s['scroll_to']])
+                      if not r or not r[1]:
+                          raise Fail('scroll-to-missing', '%s matches, none visible' % (r and r[0]))
+                      time.sleep(2)
+                      rc = js(RECT, [s['scroll_to']])
+                      if not rc or rc[0] < 0 or rc[1] > rc[2]:
+                          raise Fail('scroll-to-not-in-view', 'rect %s' % rc)
+                  if s.get('require_text'):
+                      body = js('return document.body ? document.body.innerText : "";') or ''
+                      if s['require_text'] not in body:
+                          raise Fail('require-text-missing', 'page text starts: %r' % body[:160])
+                  steps = [None]
+                  if s.get('full'):
+                      h = js(DIMS)
                       steps = list(range(0, max(h[0] - h[1], 0) + 1, max(h[1] - 120, 200)))[:8]
+                  last = None
                   for j, y in enumerate(steps):
-                      if sid and (y or j):
-                          wd('POST', '/session/%s/execute/sync' % sid, {'script': 'window.scrollTo(0, arguments[0])', 'args': [y]})
+                      if y is not None:
+                          got = js(SCROLL, [y])
+                          if last is not None and got is not None and got <= last:
+                              break  # the page stopped scrolling: no duplicate bottom shots
+                          last = got
                           time.sleep(1.5)
                       shot('out/%s-%d.png' % (n, j))
-                  log.append('%s ok %d' % (n, len(steps)))
+                  note('%s ok %d' % (n, len(steps)))
               except Exception as e:
-                  log.append('%s fail %s' % (n, type(e).__name__))
+                  failed += 1
+                  why, detail = (e.args[0], e.args[1] if len(e.args) > 1 else '') if isinstance(e, Fail) else (type(e).__name__, str(e)[:300])
+                  note('%s fail %s' % (n, why), detail)
+                  try:
+                      shot('out/%s-fail.png' % n)
+                  except Exception:
+                      pass
           if sid:
               try: wd('DELETE', '/session/%s' % sid)
               except Exception: pass
           if drv: drv.terminate()
           open('out/log.txt', 'w').write('\n'.join(log) + '\n')
-          print('\n'.join(log))
+          print('\n'.join(pub))
+          sys.exit(1 if failed else 0)
           PY
 
       - name: Encrypt result
+        if: always()
         env:
           SHOT_KEY: ${{ secrets.SHOT_KEY }}
         run: |
@@ -129,6 +214,7 @@ jobs:
           rm -rf out work
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: shots-${{ inputs.id }}
           path: result.enc
