@@ -212,7 +212,10 @@ jobs:
           if drv: drv.terminate()
           open('out/log.txt', 'w').write('\n'.join(log) + '\n')
           print('\n'.join(pub))
-          sys.exit(1 if failed else 0)
+          # quiet-1005: a failed shot (page check, missing text) is recorded in out/log.txt as 'NN fail ...', which
+          # iphone-sim-shot reads and turns into its own non-zero exit. Exiting 1 here only made GitHub email Daniel
+          # 'Run failed' for every QA check that caught a page problem (6 of 35 runs on 10-05).
+          sys.exit(0)
           PY
 
       - name: Encrypt result
