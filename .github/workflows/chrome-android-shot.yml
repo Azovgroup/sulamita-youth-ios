@@ -1,0 +1,312 @@
+name: Chrome shot (Android emulator)
+run-name: chrome-android-shot ${{ inputs.id }}
+
+# Screenshots of web pages in real Chrome on an Android emulator (Google APIs image, Pixel-class profile) for
+# the box's android-sim-shot tool. Same rule as safari-shot.yml: the job (URLs, sign-in cookies) arrives
+# encrypted and the PNGs leave encrypted with the SHOT_KEY secret, so nothing readable lands in this public
+# repo's logs or artifacts. Every shot must see a Chrome-on-Android user agent or it fails.
+on:
+  workflow_dispatch:
+    inputs:
+      id:
+        description: run id chosen by the box
+        required: true
+      job:
+        description: encrypted job (base64)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  shot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Decrypt job
+        env:
+          SHOT_KEY: ${{ secrets.SHOT_KEY }}
+          JOB: ${{ inputs.job }}
+        run: |
+          mkdir -p work out
+          printf '%s' "$JOB" | openssl base64 -d -A | openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:SHOT_KEY -out work/job.json
+          python3 -c "import json;j=json.load(open('work/job.json'));print('shots:',len(j['shots']))"
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Write shooter
+        run: |
+          cat > work/shoot.py <<'PY'
+          # Runs inside the emulator step. A shot that cannot do what was asked FAILS (log line "NN fail <why>"),
+          # never a stand-in. Public stdout carries status words only; detail (UA, device, errors) goes to
+          # out/log.txt, which leaves encrypted. android-sim-shot on the box re-checks every "NN ua" line.
+          import io, json, os, re, stat, subprocess, sys, time, urllib.request, urllib.error, zipfile
+          job = json.load(open('work/job.json'))
+          SERIAL = 'emulator-5554'
+          SDK = os.environ.get('ANDROID_HOME') or os.environ.get('ANDROID_SDK_ROOT') or ''
+          PT = os.path.join(SDK, 'platform-tools')
+          ENV = dict(os.environ, PATH=PT + os.pathsep + os.environ.get('PATH', ''))
+          log, pub = [], []
+          def note(line, detail=''):
+              log.append(line + ((' :: ' + detail) if detail else ''))
+              pub.append(line)
+          def adb(*a, timeout=60):
+              return subprocess.run(['adb', '-s', SERIAL, *a], capture_output=True, timeout=timeout, env=ENV)
+          def sh(cmd):
+              return adb('shell', cmd).stdout.decode(errors='replace').strip()
+          def shot(path):
+              r = adb('exec-out', 'screencap', '-p', timeout=60)
+              if r.returncode or not r.stdout.startswith(b'\x89PNG'):
+                  raise RuntimeError('screencap failed (%s)' % r.returncode)
+              open(path, 'wb').write(r.stdout)
+          class Fail(Exception):
+              pass
+          def fetch(u):
+              with urllib.request.urlopen(u, timeout=60) as r:
+                  return r.read()
+          def driver_url(ver):
+              build, major = '.'.join(ver.split('.')[:3]), ver.split('.')[0]
+              try:
+                  d = json.loads(fetch('https://googlechromelabs.github.io/chrome-for-testing/latest-patch-versions-per-build-with-downloads.json'))
+                  for x in ((d.get('builds') or {}).get(build) or {}).get('downloads', {}).get('chromedriver', []):
+                      if x['platform'] == 'linux64':
+                          return x['url']
+              except Exception:
+                  pass
+              try:
+                  d = json.loads(fetch('https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json'))
+                  best = None
+                  for v in d['versions']:
+                      if v['version'].split('.')[0] == major:
+                          for x in v.get('downloads', {}).get('chromedriver', []):
+                              if x['platform'] == 'linux64':
+                                  best = x['url']
+                  if best:
+                      return best
+              except Exception:
+                  pass
+              rel = fetch('https://chromedriver.storage.googleapis.com/LATEST_RELEASE_%s' % major).decode().strip()
+              return 'https://chromedriver.storage.googleapis.com/%s/chromedriver_linux64.zip' % rel
+          # ---- device setup -------------------------------------------------------------------------------
+          if not sh('pm path com.android.chrome').startswith('package:'):
+              note('setup fail no-chrome', 'this system image has no com.android.chrome')
+              ver = ''
+          else:
+              m = re.search(r'versionName=(\S+)', sh('dumpsys package com.android.chrome'))
+              ver = m.group(1) if m else ''
+          log.append('device: %s / Android %s / Chrome %s' % (sh('getprop ro.product.model'), sh('getprop ro.build.version.release'), ver or '?'))
+          adb('root')
+          time.sleep(3)
+          adb('wait-for-device', timeout=120)
+          sh('am set-debug-app --persistent com.android.chrome')
+          sh('pm grant com.android.chrome android.permission.POST_NOTIFICATIONS')
+          sh('settings put global sysui_demo_allowed 1')
+          sh('am broadcast -a com.android.systemui.demo -e command enter')
+          sh('am broadcast -a com.android.systemui.demo -e command clock -e hhmm 0941')
+          sh('am broadcast -a com.android.systemui.demo -e command battery -e level 100 -e plugged false')
+          sh('am broadcast -a com.android.systemui.demo -e command notifications -e visible false')
+          cd = None
+          if ver:
+              try:
+                  u = driver_url(ver)
+                  z = zipfile.ZipFile(io.BytesIO(fetch(u)))
+                  name = [n for n in z.namelist() if n.split('/')[-1] == 'chromedriver'][0]
+                  open('work/chromedriver', 'wb').write(z.read(name))
+                  os.chmod('work/chromedriver', 0o755)
+                  cd = os.path.abspath('work/chromedriver')
+                  log.append('chromedriver: ' + ((re.search(r'/(\d+\.\d+\.\d+\.\d+)/', u) or re.search('(.*)', u)).group(1)))
+              except Exception as e:
+                  note('setup fail no-chromedriver', '%s %s' % (type(e).__name__, str(e)[:200]))
+          def wd(method, path, body=None, timeout=120):
+              req = urllib.request.Request('http://127.0.0.1:9515' + path, method=method,
+                                           data=json.dumps(body).encode() if body is not None else None,
+                                           headers={'Content-Type': 'application/json'})
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as r:
+                      return json.load(r).get('value')
+              except urllib.error.HTTPError as e:
+                  try:
+                      v = json.load(e).get('value') or {}
+                  except Exception:
+                      v = {}
+                  raise RuntimeError('HTTP %s %s: %s' % (e.code, v.get('error', ''), str(v.get('message', ''))[:300]))
+          drv, sid = None, None
+          for attempt in range(1, 5 if cd else 1):
+              try:
+                  if drv:
+                      drv.terminate()
+                      try: drv.wait(10)
+                      except Exception: drv.kill()
+                  drv = subprocess.Popen([cd, '--port=9515'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=ENV)
+                  for _ in range(20):
+                      try:
+                          wd('GET', '/status', timeout=5)
+                          break
+                      except Exception:
+                          time.sleep(1)
+                  v = wd('POST', '/session', {'capabilities': {'alwaysMatch': {'browserName': 'chrome', 'goog:chromeOptions': {
+                      'androidPackage': 'com.android.chrome', 'androidDeviceSerial': SERIAL,
+                      'args': ['--disable-fre', '--no-first-run', '--no-default-browser-check', '--disable-notifications']}}}}, timeout=180)
+                  sid = v['sessionId']
+                  note('driver: chromedriver (try %d)' % attempt)
+                  break
+              except Exception as e:
+                  note('driver try %d failed' % attempt, '%s %s' % (type(e).__name__, e))
+                  sh('am force-stop com.android.chrome')
+                  time.sleep(6 * attempt)
+          if not sid:
+              note('driver: none')
+          def js(script, args=()):
+              return wd('POST', '/session/%s/execute/sync' % sid, {'script': script, 'args': list(args)})
+          FIND = ('var b=null,a=document.querySelectorAll("*");for(var i=0;i<a.length;i++){var e=a[i];'
+                  'if(e.scrollHeight-e.clientHeight>40&&e.clientHeight>200){var o=getComputedStyle(e).overflowY;'
+                  'if((o==="auto"||o==="scroll")&&(!b||e.clientHeight>b.clientHeight))b=e;}}')
+          SCROLL = FIND + 'window.scrollTo(0,arguments[0]);if(b)b.scrollTop=arguments[0];return b?b.scrollTop:window.scrollY;'
+          DIMS = FIND + 'return b?[b.scrollHeight,b.clientHeight]:[document.documentElement.scrollHeight,window.innerHeight];'
+          BOTTOM = FIND + ('return b?[Math.ceil(b.scrollTop+b.clientHeight),b.scrollHeight]'
+                           ':[Math.ceil(window.scrollY+window.innerHeight),document.documentElement.scrollHeight];')
+          FIRST = ('var a=document.querySelectorAll(arguments[0]),e=null;for(var i=0;i<a.length;i++)'
+                   '{if(a[i].getClientRects().length){e=a[i];break;}}')
+          CLICK = FIRST + 'if(!e)return [a.length,false];e.scrollIntoView({block:"center"});e.click();return [a.length,true];'
+          TO = FIRST + 'if(!e)return [a.length,false];e.scrollIntoView({block:"center",inline:"nearest"});return [a.length,true];'
+          HIDDEN = ('var e=document.querySelector(arguments[0]);if(!e)return "no match";var o=[];'
+                    'for(var x=e;x&&x!==document.body;x=x.parentElement){var c=getComputedStyle(x);'
+                    'if(c.display==="none"||c.visibility==="hidden")o.push(x.tagName+"."+String(x.className).split(" ").slice(0,2).join(".")+" "+c.display);}'
+                    'return "hidden by: "+(o.join(" < ")||"none (zero-size)");')
+          RECT = FIRST + 'if(!e)return null;var r=e.getBoundingClientRect();return [Math.round(r.top),Math.round(r.bottom),window.innerHeight];'
+          UA_OK = lambda ua: (re.search(r'\bAndroid\b', ua) and re.search(r'\bChrome/\d', ua) and re.search(r'\bMobile\b', ua)
+                              and not re.search(r'iPhone|iPad|iPod|Macintosh|Windows NT|X11|CrOS|CriOS|; wv\)', ua))
+          def in_front():
+              # A system dialog (ANR, permission sheet) over Chrome takes the focus: that screen is not the page.
+              f = re.search(r'mCurrentFocus=.*', sh('dumpsys window | grep -m1 mCurrentFocus') or '')
+              if f and 'com.android.chrome' not in f.group(0):
+                  raise Fail('chrome-not-in-front', f.group(0)[:200])
+          for i, s in enumerate(job['shots']):
+              n = '%02d' % i
+              wait = float(s.get('wait', 6))
+              try:
+                  if not sid:
+                      raise Fail('needs-driver', 'chromedriver never came up')
+                  url = s['url']
+                  if s.get('cookies') or s.get('storage'):
+                      wd('POST', '/session/%s/url' % sid, {'url': url})
+                      for c in s.get('cookies') or []:
+                          ck = {k: c[k] for k in ('name', 'value', 'path', 'secure', 'httpOnly') if k in c}
+                          wd('POST', '/session/%s/cookie' % sid, {'cookie': ck})
+                      st = s.get('storage') or {}
+                      for area in ('localStorage', 'sessionStorage'):
+                          for k, val in (st.get(area) or {}).items():
+                              js('window[arguments[0]].setItem(arguments[1], arguments[2])', [area, k, str(val)])
+                      wd('POST', '/session/%s/url' % sid, {'url': 'about:blank'})
+                  wd('POST', '/session/%s/url' % sid, {'url': url})
+                  time.sleep(wait)
+                  ua = str(js('return navigator.userAgent;') or '')
+                  log.append('%s ua %s' % (n, ua))
+                  if not UA_OK(ua):
+                      raise Fail('not-chrome-android', ua[:200])
+                  want_host = re.sub(r'^https?://([^/:?#]+).*$', r'\1', url).lower()
+                  got_host = str(js('return location.hostname;') or '').lower()
+                  if got_host != want_host:
+                      raise Fail('wrong-page', 'on %s, asked %s' % (got_host, want_host))
+                  if s.get('click'):
+                      r = js(CLICK, [s['click']])
+                      if not r or not r[1]:
+                          raise Fail('click-target-missing', '%s matches, none visible' % (r and r[0]))
+                      time.sleep(wait)
+                  if s.get('scroll'):
+                      js(SCROLL, [int(s['scroll'])])
+                      time.sleep(1.5)
+                  if s.get('scroll_to'):
+                      deadline = time.time() + 30
+                      while True:
+                          r = js(TO, [s['scroll_to']])
+                          if (r and r[1]) or time.time() > deadline:
+                              break
+                          time.sleep(1)
+                      if not r or not r[1]:
+                          why = js(HIDDEN, [s['scroll_to']])
+                          raise Fail('scroll-to-missing', '%s matches, none visible after 30 s; %s' % (r and r[0], why))
+                      time.sleep(2)
+                      rc = js(RECT, [s['scroll_to']])
+                      if not rc or rc[0] < 0 or rc[1] > rc[2]:
+                          raise Fail('scroll-to-not-in-view', 'rect %s' % rc)
+                  if s.get('require_text'):
+                      body = js('return document.body ? document.body.innerText : "";') or ''
+                      if s['require_text'] not in body:
+                          raise Fail('require-text-missing', 'page text starts: %r' % body[:160])
+                  steps = [None]
+                  if s.get('full'):
+                      h = js(DIMS)
+                      # Screens 120 px apart in overlap, and ALWAYS the bottom offset last (h[0]-h[1]), so the final
+                      # shot shows the end of whatever element scrolls. Sliced one past the 8-shot cap so a page
+                      # too tall for 8 screens is seen and failed below, never cut short and called ok.
+                      steps = sorted(set(list(range(0, max(h[0] - h[1], 0), max(h[1] - 120, 200))) + [max(h[0] - h[1], 0)]))[:9]
+                      if len(steps) > 8:
+                          raise Fail('full-too-tall', 'height %s, viewport %s needs more than 8 screens' % (h[0], h[1]))
+                  last, taken = None, 0
+                  for j, y in enumerate(steps):
+                      if y is not None:
+                          got = js(SCROLL, [y])
+                          if last is not None and got is not None and got <= last:
+                              break  # the scroller stopped moving: no duplicate bottom shots; the bottom check decides
+                          last = got
+                          time.sleep(1.5)
+                      in_front()
+                      shot('out/%s-%d.png' % (n, j))
+                      taken += 1
+                  if s.get('full'):
+                      # The screen on record must be the bottom: scrollTop + visible height reaches scrollHeight.
+                      e = js(BOTTOM)
+                      if not e or e[0] < e[1] - 2:
+                          raise Fail('full-bottom-not-reached', 'scrolled to %s of %s' % (e and e[0], e and e[1]))
+                  note('%s ok %d' % (n, taken))
+              except Exception as e:
+                  why, detail = (e.args[0], e.args[1] if len(e.args) > 1 else '') if isinstance(e, Fail) else (type(e).__name__, str(e)[:300])
+                  note('%s fail %s' % (n, why), detail)
+                  try:
+                      shot('out/%s-fail.png' % n)
+                  except Exception:
+                      pass
+          if sid:
+              try: wd('DELETE', '/session/%s' % sid)
+              except Exception: pass
+          if drv: drv.terminate()
+          open('out/log.txt', 'w').write('\n'.join(log) + '\n')
+          print('\n'.join(pub))
+          # As in safari-shot.yml: failures live in out/log.txt ("NN fail ..."), which android-sim-shot turns into
+          # its own non-zero exit; exiting 1 here would only make GitHub email "Run failed" for a caught page problem.
+          sys.exit(0)
+          PY
+
+      - name: Boot emulator and shoot
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0, 2026-07-05
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          disk-size: 6000M
+          emulator-boot-timeout: 900
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: python3 work/shoot.py
+
+      - name: Encrypt result
+        if: always()
+        env:
+          SHOT_KEY: ${{ secrets.SHOT_KEY }}
+        run: |
+          mkdir -p out
+          tar -czf - -C out . | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -pass env:SHOT_KEY -out result.enc
+          rm -rf out work
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: shots-${{ inputs.id }}
+          path: result.enc
+          retention-days: 1
